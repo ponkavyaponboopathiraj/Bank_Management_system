@@ -1,109 +1,140 @@
-package src.repository.implementation;
-import src.repository.interfaces.RepoInterface;
-import src.repository.enums.QueryEnum;
-import src.model.dto.Account;
-import src.util.DBConfig;
+package repository.Implementation;
 
-import java.sql.*;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import DBConfig.DBConnection;
+import enums.AccountQuery;
+import exceptions.NotFoundException;
+import models.Account;
+import models.AccountType;
+import models.Branch;
+import models.Customer;
+import repository.RepoInterface;
 
 public class AccountRepo implements RepoInterface<Account> {
 
-    private final Connection conn;
+    private static AccountRepo instance;
 
-    public AccountRepo() {
-        this.conn = DBConfig.getConnection();
+    private AccountRepo() {}
+
+    public static AccountRepo getInstance() {
+        if (instance == null) {
+            instance = new AccountRepo();
+        }
+        return instance;
     }
+
+    private final Map<Integer, Account> accounts = new ConcurrentHashMap<>();
+    private final Set<Integer> unSyncedIds = ConcurrentHashMap.newKeySet();
+
     @Override
-public boolean add(Account account) {
-    try (PreparedStatement stmt = conn.prepareStatement(QueryEnum.INSERT_ACCOUNT.getQuery())) {
-        stmt.setString(1, account.getAccountNumber());
-        stmt.setInt(2, account.getCustomerId());
-        stmt.setInt(3, account.getBranchId());
-        stmt.setInt(4, account.getAccountTypeId());
-        stmt.setDouble(5, account.getBalance());
-        stmt.setTimestamp(6, account.getCreatedAt());
-        stmt.setString(7, account.getStatus());
-        return stmt.executeUpdate() > 0;
-    } catch (SQLException e) {
-        e.printStackTrace();
-        return false;
-    }
-}
+    public void loadAll() {
+        try (Connection conn = DBConnection.getInstance().getConnection();
+             PreparedStatement ps = conn.prepareStatement(AccountQuery.LOADALL.getQuery())) {
 
+            ResultSet rs = ps.executeQuery();
 
- @Override
-public Account getById(int id) {
-    try (PreparedStatement stmt = conn.prepareStatement(QueryEnum.SELECT_ACCOUNT_BY_ID.getQuery())) {
-        stmt.setInt(1, id);
-        ResultSet rs = stmt.executeQuery();
-        if (rs.next()) {
-            return new Account(
-                rs.getInt("account_id"),
-                rs.getString("account_number"),
-                rs.getInt("customer_id"),
-                rs.getInt("branch_id"),
-                rs.getInt("account_type_id"),
-                rs.getDouble("balance"),
-                rs.getTimestamp("created_at"),
-                rs.getString("status")
-            );
+            while (rs.next()) {
+                try {
+                    AccountType accountType = AccountTypeRepo.getInstance().getById(rs.getInt("account_type_id"));
+                    Branch branch = BranchRepo.getInstance().getById(rs.getInt("branch_id"));
+                    Customer customer = CustomerRepo.getInstance().getById(rs.getInt("customer_id"));
+
+                    Account account = new Account();
+                    account.setAccountId(rs.getInt("account_id"));
+                    account.setAccountNumber(rs.getString("account_number"));
+                    account.setBalance(rs.getDouble("balance"));
+                    account.setCreatedAt(rs.getTimestamp("created_at").toLocalDateTime());
+                    account.setStatus(rs.getString("is_active"));
+                    account.setAccountType(accountType);
+                    account.setBranch(branch);
+                    account.setCustomer(customer);
+
+                    accounts.put(account.getAccountId(), account);
+
+                } catch (NotFoundException e) {
+                    System.out.println("Account load failed: " + e.getMessage());
+                }
+            }
+
+        } catch (SQLException e) {
+            System.out.println("Error loading accounts: " + e.getMessage());
         }
-    } catch (SQLException e) {
-        e.printStackTrace();
     }
-    return null;
-}
 
-@Override
-public boolean update(Account account) {
-    try (PreparedStatement stmt = conn.prepareStatement(QueryEnum.UPDATE_ACCOUNT.getQuery())) {
-        stmt.setDouble(1, account.getBalance());
-        stmt.setInt(2, account.getAccountTypeId());
-        stmt.setString(3, account.getStatus());
-        stmt.setInt(4, account.getAccountId());
-        return stmt.executeUpdate() > 0;
-    } catch (SQLException e) {
-        e.printStackTrace();
-        return false;
+    @Override
+    public List<Account> getAll() {
+        return new ArrayList<>(accounts.values());
     }
-}
 
-@Override
-public boolean deleteById(int id) {
-    try (PreparedStatement stmt = conn.prepareStatement(QueryEnum.DELETE_ACCOUNT.getQuery())) {
-        stmt.setInt(1, id);
-        return stmt.executeUpdate() > 0;
-    } catch (SQLException e) {
-        e.printStackTrace();
-        return false;
+    @Override
+    public void add(Account account) {
+        int id = accounts.size() + 1;
+        account.setAccountId(id);
+        addOrUpdate(account);
     }
-}
 
+    @Override
+    public void update(Account account) {
+        addOrUpdate(account);
+    }
 
+    private void addOrUpdate(Account account) {
+        accounts.put(account.getAccountId(), account);
+        unSyncedIds.add(account.getAccountId());
+    }
 
-@Override
-public List<Account> getAll() {
-    List<Account> list = new ArrayList<>();
-    try (PreparedStatement stmt = conn.prepareStatement(QueryEnum.SELECT_ALL_ACCOUNTS.getQuery())) {
-        ResultSet rs = stmt.executeQuery();
-        while (rs.next()) {
-            list.add(new Account(
-                rs.getInt("account_id"),
-                rs.getString("account_number"),
-                rs.getInt("customer_id"),
-                rs.getInt("branch_id"),
-                rs.getInt("account_type_id"),
-                rs.getDouble("balance"),
-                rs.getTimestamp("created_at"),
-                rs.getString("status")
-            ));
+    @Override
+    public void deleteById(int id) {
+        accounts.remove(id);
+        unSyncedIds.add(id);
+    }
+
+    public Account getById(int id) {
+        Account account = accounts.get(id);
+        if (account == null) {
+            throw new NotFoundException("Account not found with ID: " + id);
         }
-    } catch (SQLException e) {
-        e.printStackTrace();
+        return account;
     }
-    return list;
-}
 
+    @Override
+    public void syncChanges() {
+        if (unSyncedIds.isEmpty()) {
+            return;
+        }
+
+        try (Connection conn = DBConnection.getInstance().getConnection()) {
+            for (int id : unSyncedIds) {
+                Account account = accounts.get(id);
+                if (account == null) continue;
+
+                try (PreparedStatement ps = conn.prepareStatement(AccountQuery.INSERT.getQuery())) {
+                    ps.setInt(1, account.getAccountId());
+                    ps.setString(2, account.getAccountNumber());
+                    ps.setDouble(3, account.getBalance());
+                    ps.setInt(4, account.getAccountType().getAccountTypeId());
+                    ps.setInt(5, account.getBranch().getBranchId());
+                    ps.setInt(6, account.getCustomer().getUser().getUserId());
+                    ps.setString(7, account.getStatus());
+                    ps.setTimestamp(8, java.sql.Timestamp.valueOf(account.getCreatedAt()));
+
+                    ps.executeUpdate();
+                }
+            }
+
+        } catch (SQLException e) {
+            System.out.println("Error syncing account changes: " + e.getMessage());
+        }
+
+        unSyncedIds.clear();
+    }
 }
